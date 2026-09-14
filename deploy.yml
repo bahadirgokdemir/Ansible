@@ -140,17 +140,17 @@
     - name: "03a - DEBUG: Ham API yaniti (ilk sayfa)"
       ansible.builtin.debug:
         msg:
-          status: "{{ talep_pages.results[0].status | default('yok') }}"
+          status_code: "{{ talep_pages.results[0].status_code | default('yok') }}"
           content_type: "{{ talep_pages.results[0].content_type | default('yok') }}"
-          json_var_turu: "{{ talep_pages.results[0].json | default('YOK') | type_debug }}"
-          ham_icerik: "{{ (talep_pages.results[0].content | default('')) | truncate(3000) }}"
+          kayit_sayisi: "{{ (talep_pages.results[0].content | default([])) | length }}"
+          ham_icerik: "{{ talep_pages.results[0].content | default([]) }}"
 
     - name: "03b - Talep listesini birlestir"
       ansible.builtin.set_fact:
         talepler: >-
           {%- set out = [] -%}
           {%- for r in talep_pages.results -%}
-            {%- for t in (r.json | default([], true)) -%}
+            {%- for t in (r.content | default([], true)) -%}
               {%- if t.id is defined and t.id -%}
                 {%- set _ = out.append({
                       'environment': r.item.0,
@@ -212,7 +212,7 @@
           {%- set out = [] -%}
           {%- set seen = [] -%}
           {%- for r in detay_result.results -%}
-            {%- for d in (r.json | default([], true)) -%}
+            {%- for d in (r.content | default([], true)) -%}
               {%- set key = (r.item.id | string) ~ '|' ~ (d.itemName | default('')) ~ '|' ~ (d.artipath | default(d.artiPath | default(''))) -%}
               {%- if key not in seen and (d.artipath | default(d.artiPath | default(''))) -%}
                 {%- set _ = seen.append(key) -%}
