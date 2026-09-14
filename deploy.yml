@@ -126,7 +126,7 @@
     # ========================================================
     - name: "03 - YT talepleri cek"
       ansible.windows.win_uri:
-        url: "{{ (web_service_url ~ '/comprepo-deployment-requests?search=state:YT AND envName:' ~ item.0 ~ '&page:' ~ item.1 ~ '&pageSize:' ~ talep_page_size) | replace(' ', '%20') }}"
+        url: "{{ (web_service_url ~ '/comprepo-deployment-requests?search=state:YT AND envName:' ~ item.0 ~ '&page=' ~ item.1 ~ '&pageSize=' ~ talep_page_size) | replace(' ', '%20') }}"
         method: GET
         headers:
           Authorization: "Bearer {{ deploy_token }}"
@@ -136,6 +136,14 @@
         label: "{{ item.0 }} / sayfa {{ item.1 }}"
       register: talep_pages
       changed_when: false
+
+    - name: "03a - DEBUG: Ham API yaniti (ilk sayfa)"
+      ansible.builtin.debug:
+        msg:
+          status: "{{ talep_pages.results[0].status | default('yok') }}"
+          content_type: "{{ talep_pages.results[0].content_type | default('yok') }}"
+          json_var_turu: "{{ talep_pages.results[0].json | default('YOK') | type_debug }}"
+          ham_icerik: "{{ (talep_pages.results[0].content | default('')) | truncate(3000) }}"
 
     - name: "03b - Talep listesini birlestir"
       ansible.builtin.set_fact:
