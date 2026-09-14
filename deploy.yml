@@ -142,8 +142,13 @@
         msg:
           status_code: "{{ talep_pages.results[0].status_code | default('yok') }}"
           content_type: "{{ talep_pages.results[0].content_type | default('yok') }}"
+          content_veri_tipi: "{{ talep_pages.results[0].content | type_debug }}"
           kayit_sayisi: "{{ (talep_pages.results[0].content | default([])) | length }}"
-          ham_icerik: "{{ talep_pages.results[0].content | default([]) }}"
+          ilk_kayit_anahtarlari: >-
+            {{ (talep_pages.results[0].content[0].keys() | list)
+               if ((talep_pages.results[0].content | default([])) | length > 0)
+               else 'kayit_yok' }}
+          ham_json: "{{ talep_pages.results[0].content | to_nice_json }}"
 
     - name: "03b - Talep listesini birlestir"
       ansible.builtin.set_fact:
