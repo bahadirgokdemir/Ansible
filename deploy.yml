@@ -1,0 +1,428 @@
+# ============================================================================
+# Front Deploy - Request Watcher  (HIBRIT TOPOLOJI)
+# ============================================================================
+# NEDEN HIBRIT:
+#   - KYS/token API ve artifact repo erisimi YALNIZCA INFPRDDIAG'dan acik
+#     -> bu adimlar Windows hedefinde (win_* modulleri) calisir.
+#   - NetApp SMB erisimi YALNIZCA OpenShift cluster IP'lerinden acik
+#     -> yazma adimi delegate_to: localhost ile EE pod'unda smbclient ile yapilir.
+#
+#   AKIS:  [DIAG] token -> talep -> detay -> indir
+#          -> fetch (DIAG -> EE)
+#          -> [EE/OCP] smbclient ile NetApp'e yaz
+#          -> [DIAG] statu guncelle   <-- enable_status_updates ile KAPALI (false)
+#
+#   enable_status_updates=false oldugu surece KYS kayitlarina hic POST
+#   atilmaz (eski davranis). Sadece tespit + indirme + NetApp'e yazma.
+#
+# GEREKSINIM (EE tarafinda): samba-client paketi (smbclient binary).
+#   Custom EE'ye eklenmesi gerekir:  RUN dnf install -y samba-client
+#
+# EXTRA VARS (AAP - sifreli/Survey):
+#   proxy_user, proxy_password, proxy_url (ops.), deploy_api_token (fallback),
+#   smb_user, smb_password
+# ============================================================================
+
+- name: Front Deploy - Request Watcher
+  hosts: windows_targets          # INFPRDDIAG
+  gather_facts: false
+
+  vars:
+    # --- API ---
+    web_service_url: "https://kysbackend.ibtech.com.tr/api"
+    token_api_url: "https://infraapps.qnb.com.tr/api/GetTokenKysApi/GetData"
+    deploy_environments: [test, preprod, prod]
+    talep_page_size: 100
+    talep_max_pages: 3            # env basina cekilecek sayfa (3 x 100 = 300 kayit)
+    http_timeout_seconds: 30
+
+    # --- Staging (DIAG uzerinde gecici indirme alani) ---
+    win_stage_dir: 'D:\temp\frontdeploy_stage'
+    ee_stage_dir: '/tmp/frontdeploy'
+
+    # --- NetApp / SMB (hedef: OCP pod'undan yazilir) ---
+    repo_shares:
+      istanbul: '//10.81.204.231/deployrepo'
+      ankara:   '//10.25.204.231/deployrepo_ank'
+    env_repo_share:
+      test: istanbul
+      preprod: istanbul
+      prod: istanbul
+
+    # --- Kilitler ---
+    enable_processing: true         # indirme + NetApp'e yazma
+    # KAPALI: talep/detay statusu DEGISMEZ, release history YAZILMAZ.
+    # Indirme/NetApp tarafi tamamen dogrulanana kadar false kalsin.
+    # Acmak icin AAP extra var: enable_status_updates: true
+    enable_status_updates: false
+
+    # --- Mail ---
+    mail_smtp_host: "mailgw.finansbank.com.tr"
+    mail_smtp_port: 25
+    mail_from: "ansible@qnbfinansbank.com"
+    mail_to: "bahadir.gokdemir@ibtech.com.tr"
+
+  tasks:
+
+    # ========================================================
+    # 01 - Tarih (dizin sablonu icin)
+    # ========================================================
+    - name: "01 - Tarih bilgisi"
+      ansible.builtin.set_fact:
+        dt:
+          year: "{{ '%Y' | strftime }}"
+          month: "{{ '%m' | strftime }}"
+          day: "{{ '%d' | strftime }}"
+          stamp: "{{ '%Y%m%d%H%M%S' | strftime }}"
+
+    # ========================================================
+    # 02 - Token (proxy NTLM gerektigi icin tek PS blogu kaldi;
+    #      uri/win_uri NTLM proxy auth yapamiyor)
+    # ========================================================
+    - name: "02 - Token al (GetTokenKysApi, proxy NTLM)"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $cred = New-Object System.Management.Automation.PSCredential(
+              '{{ proxy_user }}',
+              (ConvertTo-SecureString '{{ proxy_password }}' -AsPlainText -Force))
+          $args = @{ Uri = '{{ token_api_url }}'; Method = 'Get'
+                     TimeoutSec = {{ http_timeout_seconds }}; UseBasicParsing = $true
+                     Credential = $cred }
+          $p = '{{ proxy_url | default("") }}'
+          if (-not $p) {
+              $ie = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -EA SilentlyContinue).ProxyServer
+              if ($ie) { $p = "http://$ie" }
+          }
+          if ($p) { $args['Proxy'] = $p; $args['ProxyCredential'] = $cred }
+          try {
+              $t = (Invoke-WebRequest @args).Content.Trim()
+              if (-not $t.StartsWith('eyJ')) { throw "gecersiz token" }
+              @{ ok = $true; token = $t } | ConvertTo-Json -Compress
+          } catch {
+              @{ ok = $false; token = ''; error = $_.Exception.Message } | ConvertTo-Json -Compress
+          }
+      register: token_raw
+      changed_when: false
+      no_log: true
+
+    - name: "02b - Tokeni ayarla (otomatik / statik fallback)"
+      ansible.builtin.set_fact:
+        tf: "{{ token_raw.output[0] | from_json }}"
+      no_log: true
+
+    - name: "02c - deploy_token"
+      ansible.builtin.set_fact:
+        deploy_token: "{{ tf.token if tf.ok else (deploy_api_token | default('')) }}"
+      no_log: true
+
+    - name: "02d - Token yoksa dur"
+      ansible.builtin.fail:
+        msg: "Kullanilacak token yok. Otomatik alim hatasi: {{ tf.error | default('-') }}"
+      when: deploy_token | length == 0
+
+    # ========================================================
+    # 03 - Get-Talep (state:YT) - ortam x sayfa
+    # ========================================================
+    - name: "03 - YT talepleri cek"
+      ansible.windows.win_uri:
+        url: "{{ (web_service_url ~ '/comprepo-deployment-requests?search=state:YT AND envName:' ~ item.0 ~ '&page:' ~ item.1 ~ '&pageSize:' ~ talep_page_size) | replace(' ', '%20') }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ deploy_token }}"
+        return_content: true
+      loop: "{{ deploy_environments | product(range(1, talep_max_pages + 1)) | list }}"
+      loop_control:
+        label: "{{ item.0 }} / sayfa {{ item.1 }}"
+      register: talep_pages
+      changed_when: false
+
+    - name: "03b - Talep listesini birlestir"
+      ansible.builtin.set_fact:
+        talepler: >-
+          {%- set out = [] -%}
+          {%- for r in talep_pages.results -%}
+            {%- for t in (r.json | default([], true)) -%}
+              {%- if t.id is defined and t.id -%}
+                {%- set _ = out.append({
+                      'environment': r.item.0,
+                      'id': t.id | string,
+                      'platform': (t.platform.description | default('bilinmiyor')),
+                      'recordDate': t.recordDate | default('') }) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out | unique }}
+
+    - name: "04 - Tespit ozeti"
+      ansible.builtin.debug:
+        msg: >-
+          {{ talepler | length }} adet YT talep:
+          {{ talepler | map(attribute='environment') | zip(talepler | map(attribute='id')) | list }}
+
+    - name: "04b - Talep yoksa bitir"
+      ansible.builtin.meta: end_play
+      when: talepler | length == 0
+
+    # ========================================================
+    # 05 - Bildirim maili (DIAG uzerinden - mailgw sadece oradan acik)
+    # ========================================================
+    - name: "05 - Bildirim maili"
+      ansible.windows.win_powershell:
+        script: |
+          $b = @'
+          {% for t in talepler %}
+          Ortam: {{ t.environment }} | TalepID: {{ t.id }} | Platform: {{ t.platform }} | Kayit: {{ t.recordDate }}
+          {% endfor %}
+          '@
+          Send-MailMessage -SmtpServer '{{ mail_smtp_host }}' -Port {{ mail_smtp_port }} `
+              -From '{{ mail_from }}' -To '{{ mail_to }}' `
+              -Subject 'Front Deploy - {{ talepler | length }} YT talep tespit edildi' -Body $b
+      changed_when: false
+      failed_when: false
+
+    # ========================================================
+    # 06 - Get-TalepDetay (item/artiPath)
+    # ========================================================
+    - name: "06 - Talep detaylarini cek"
+      ansible.windows.win_uri:
+        url: "{{ web_service_url }}/comprepo-deployment-request-details?search=deploymentRequest.id:IN({{ item.id }})"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ deploy_token }}"
+        return_content: true
+      loop: "{{ talepler }}"
+      loop_control:
+        label: "{{ item.environment }}/{{ item.id }}"
+      register: detay_result
+      when: enable_processing | bool
+      changed_when: false
+
+    - name: "06b - Indirilecek item listesi (itemName+artiPath tekil)"
+      ansible.builtin.set_fact:
+        download_items: >-
+          {%- set out = [] -%}
+          {%- set seen = [] -%}
+          {%- for r in detay_result.results -%}
+            {%- for d in (r.json | default([], true)) -%}
+              {%- set key = (r.item.id | string) ~ '|' ~ (d.itemName | default('')) ~ '|' ~ (d.artipath | default(d.artiPath | default(''))) -%}
+              {%- if key not in seen and (d.artipath | default(d.artiPath | default(''))) -%}
+                {%- set _ = seen.append(key) -%}
+                {%- set _ = out.append({
+                      'environment': r.item.environment,
+                      'talepId': r.item.id | string,
+                      'itemName': d.itemName,
+                      'artiPath': d.artipath | default(d.artiPath),
+                      'fileName': (d.artipath | default(d.artiPath)) | basename }) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+      when: enable_processing | bool
+
+    # ========================================================
+    # 07 - INDIRME (DIAG uzerinde staging) - artifact repo sadece
+    #      DIAG'dan erisilebilir oldugu icin burada.
+    # ========================================================
+    - name: "07 - Staging dizinleri"
+      ansible.windows.win_file:
+        path: "{{ win_stage_dir }}\\{{ item.talepId }}"
+        state: directory
+      loop: "{{ download_items | default([]) }}"
+      loop_control:
+        label: "{{ item.talepId }}"
+      when: enable_processing | bool
+
+    - name: "07b - Artifact indir (DIAG)"
+      ansible.windows.win_get_url:
+        url: "{{ item.artiPath }}"
+        dest: "{{ win_stage_dir }}\\{{ item.talepId }}\\{{ item.fileName }}"
+        timeout: "{{ http_timeout_seconds }}"
+      loop: "{{ download_items | default([]) }}"
+      loop_control:
+        label: "{{ item.talepId }}/{{ item.fileName }}"
+      register: dl_result
+      failed_when: false
+      when: enable_processing | bool
+
+    # ========================================================
+    # 08 - DIAG -> EE (OCP pod) dosya transferi
+    # ========================================================
+    - name: "08 - Dosyalari EE'ye cek"
+      ansible.builtin.fetch:
+        src: "{{ win_stage_dir }}\\{{ item.talepId }}\\{{ item.fileName }}"
+        dest: "{{ ee_stage_dir }}/{{ item.talepId }}/{{ item.fileName }}"
+        flat: true
+      loop: "{{ download_items | default([]) }}"
+      loop_control:
+        label: "{{ item.talepId }}/{{ item.fileName }}"
+      register: fetch_result
+      failed_when: false
+      when: enable_processing | bool
+
+    # ========================================================
+    # 09 - NetApp'e YAZMA  (EE / OpenShift pod - SMB bu IP'den acik)
+    # ========================================================
+    - name: "09 - NetApp dizin agaci (smbclient, OCP node IP'sinden)"
+      ansible.builtin.command:
+        argv:
+          - smbclient
+          - "{{ repo_shares[env_repo_share[item.environment]] }}"
+          - "-m"
+          - "SMB3"
+          - "-U"
+          - "{{ smb_user }}%{{ smb_password }}"
+          - "-c"
+          - >-
+            prompt OFF; recurse OFF;
+            {% for p in [item.environment, dt.year, dt.month, dt.day, item.talepId] %}mkdir "{{ p }}"; cd "{{ p }}"; {% endfor %}ls
+      loop: "{{ download_items | default([]) }}"
+      loop_control:
+        label: "{{ item.environment }}/{{ item.talepId }}"
+      delegate_to: localhost
+      failed_when: false          # mevcut dizin NT_STATUS_OBJECT_NAME_COLLISION doner
+      changed_when: false
+      no_log: true
+      when: enable_processing | bool
+
+    - name: "09b - Dosyayi NetApp'e yaz"
+      ansible.builtin.command:
+        argv:
+          - smbclient
+          - "{{ repo_shares[env_repo_share[item.environment]] }}"
+          - "-m"
+          - "SMB3"
+          - "-U"
+          - "{{ smb_user }}%{{ smb_password }}"
+          - "-D"
+          - "{{ item.environment }}\\{{ dt.year }}\\{{ dt.month }}\\{{ dt.day }}\\{{ item.talepId }}"
+          - "-c"
+          - 'prompt OFF; put "{{ ee_stage_dir }}/{{ item.talepId }}/{{ item.fileName }}" "{{ item.fileName }}"'
+      loop: "{{ download_items | default([]) }}"
+      loop_control:
+        label: "{{ item.talepId }}/{{ item.fileName }}"
+      delegate_to: localhost
+      register: push_result
+      failed_when: false
+      no_log: true
+      when: enable_processing | bool
+
+    - name: "09c - Yazma sonuclari"
+      ansible.builtin.debug:
+        msg: "{{ item.item.talepId }}/{{ item.item.fileName }} -> {{ 'OK' if item.rc == 0 else 'HATA: ' ~ (item.stderr | default(item.stdout) | truncate(200)) }}"
+      loop: "{{ push_result.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.fileName | default('-') }}"
+      when: enable_processing | bool
+
+    # ========================================================
+    # 10 - Basarili / hatali degerlendirme
+    # ========================================================
+    - name: "10 - Basarili ve hatali itemleri belirle"
+      ansible.builtin.set_fact:
+        basarili_items: >-
+          {%- set out = [] -%}
+          {%- for r in (push_result.results | default([])) -%}
+            {%- if (r.rc | default(1)) == 0 -%}{% set _ = out.append(r.item) %}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+        hatali_items: >-
+          {%- set out = [] -%}
+          {%- for r in (push_result.results | default([])) -%}
+            {%- if (r.rc | default(1)) != 0 -%}{% set _ = out.append(r.item) %}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      when: enable_processing | bool
+
+    - name: "10b - Talep bazli ozet (yalnizca raporlama - statu API'si CAGRILMAZ)"
+      ansible.builtin.set_fact:
+        hatali_talep_ids: "{{ hatali_items | map(attribute='talepId') | unique | list }}"
+      when: enable_processing | bool
+
+    - name: "10c - Talep bazli sonuc"
+      ansible.builtin.set_fact:
+        basarili_talepler: "{{ talepler | rejectattr('id', 'in', hatali_talep_ids) | list }}"
+        hatali_talepler: "{{ talepler | selectattr('id', 'in', hatali_talep_ids) | list }}"
+      when: enable_processing | bool
+
+    - name: "10d - Sonuc ozeti"
+      ansible.builtin.debug:
+        msg: >-
+          Toplam {{ download_items | length }} item |
+          Basarili: {{ basarili_items | length }} |
+          Hatali: {{ hatali_items | length }}
+          {{ ('(hatali talepler: ' ~ (hatali_talep_ids | join(', ')) ~ ')') if hatali_talep_ids | length > 0 else '' }}
+      when: enable_processing | bool
+
+    # ========================================================
+    # 11-14 - STATU GUNCELLEMELERI  [enable_status_updates]
+    # Varsayilan KAPALI. false oldugu surece bu 4 adim tamamen
+    # atlanir - KYS kayitlarina hicbir POST gitmez.
+    # ========================================================
+    - name: "11 - TalepDetay KD/65 (basarili item)"
+      ansible.windows.win_uri:
+        url: "{{ web_service_url }}/comprepo-deployment-request-details/{{ item.talepId }}/update-details?itemName={{ item.itemName | urlencode }}&state=KD&flowStatus=65"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ deploy_token }}"
+      loop: "{{ basarili_items | default([]) }}"
+      loop_control:
+        label: "{{ item.talepId }}/{{ item.itemName }}"
+      when: enable_status_updates | bool
+
+    - name: "12 - TalepDetay KW/63 (hatali item)"
+      ansible.windows.win_uri:
+        url: "{{ web_service_url }}/comprepo-deployment-request-details/{{ item.talepId }}/update-details?itemName={{ item.itemName | urlencode }}&state=KW&flowStatus=63"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ deploy_token }}"
+      loop: "{{ hatali_items | default([]) }}"
+      loop_control:
+        label: "{{ item.talepId }}/{{ item.itemName }}"
+      failed_when: false
+      when: enable_status_updates | bool
+
+    - name: "13 - Talep statusu (KD/65 basarili - KW/63 hatali)"
+      ansible.windows.win_uri:
+        url: >-
+          {{ web_service_url }}/comprepo-deployment-requests/{{ item.0.id }}/change-state?state={{ item.1.state }}&flowStatus={{ item.1.flow }}&explanation={{ item.1.desc | urlencode }}
+        method: POST
+        headers:
+          Authorization: "Bearer {{ deploy_token }}"
+      loop: >-
+        {{ (basarili_talepler | default([]) | product([{'state':'KD','flow':65,'desc':'RepotoFS Basarili'}]) | list)
+           + (hatali_talepler  | default([]) | product([{'state':'KW','flow':63,'desc':'RepotoFS Hatali!'}]) | list) }}
+      loop_control:
+        label: "{{ item.0.environment }}/{{ item.0.id }} -> {{ item.1.state }}"
+      failed_when: false
+      when: enable_status_updates | bool
+
+    - name: "14 - Release history"
+      ansible.windows.win_uri:
+        url: "{{ web_service_url }}/deploy-releases/{{ item.id }}?state={{ 'KW' if item.id in hatali_talep_ids else 'KD' }}&desc={{ ('RepotoFS ' ~ ('Hatali!' if item.id in hatali_talep_ids else 'Basarili')) | urlencode }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ deploy_token }}"
+      loop: "{{ talepler }}"
+      loop_control:
+        label: "{{ item.environment }}/{{ item.id }}"
+      failed_when: false
+      when: enable_status_updates | bool
+
+    # ========================================================
+    # 15 - Temizlik
+    # ========================================================
+    - name: "15 - Staging temizligi (DIAG)"
+      ansible.windows.win_file:
+        path: "{{ win_stage_dir }}"
+        state: absent
+      when: enable_processing | bool
+      failed_when: false
+
+    - name: "15b - Staging temizligi (EE)"
+      ansible.builtin.file:
+        path: "{{ ee_stage_dir }}"
+        state: absent
+      delegate_to: localhost
+      when: enable_processing | bool
+      failed_when: false
