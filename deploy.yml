@@ -29,7 +29,15 @@
 
   vars:
     # --- API ---
-    web_service_url: "https://kysbackend.ibtech.com.tr/api"
+    # --- Ortam anahtari (test dogrulamasi icin) ---
+    # AAP extra var: calisma_modu: "test"  -> kysbackendtest'e baglanir
+    #                calisma_modu: "prod"  -> gercek KYS'ye baglanir (varsayilan)
+    # Dogrulama tamamlaninca bu iki degiskeni kaldirip web_service_url'i
+    # dogrudan prod degerine sabitleyebilirsiniz.
+    calisma_modu: "prod"
+    web_service_url_test: "https://kysbackendtest.ibtech.com.tr/api"
+    web_service_url_prod: "https://kysbackend.ibtech.com.tr/api"
+    web_service_url: "{{ web_service_url_test if calisma_modu == 'test' else web_service_url_prod }}"
     token_api_url: "https://infraapps.qnb.com.tr/api/GetTokenKysApi/GetData"
     deploy_environments: [test, preprod, prod]
     talep_page_size: 100
@@ -364,6 +372,56 @@
           Basarili: {{ basarili_items | length }} |
           Hatali: {{ hatali_items | length }}
           {{ ('(hatali talepler: ' ~ (hatali_talep_ids | join(', ')) ~ ')') if hatali_talep_ids | length > 0 else '' }}
+      when: enable_processing | bool
+
+    # ========================================================
+    # 10e-10f - Sonuc raporu maili (HTML + basit bar chart)
+    # ========================================================
+    - name: "10e - HTML rapor olustur"
+      ansible.builtin.set_fact:
+        rapor_html: >-
+          {%- set toplam = (download_items | default([]) | length) -%}
+          {%- set b_sayi = (basarili_items | default([]) | length) -%}
+          {%- set h_sayi = (hatali_items | default([]) | length) -%}
+          {%- set b_pct = ((b_sayi / toplam * 100) | round(0, 'floor') | int) if toplam > 0 else 0 -%}
+          {%- set h_pct = (100 - b_pct) if toplam > 0 else 0 -%}
+          <div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;">
+          <h2 style="margin-bottom:4px;">Front Deploy - Repo to FS Sonuc Raporu</h2>
+          <p style="color:#666;margin-top:0;">{{ dt.day }}.{{ dt.month }}.{{ dt.year }} | Calisma modu: {{ calisma_modu }}</p>
+          <table style="border-collapse:collapse;width:100%;margin-bottom:12px;">
+          <tr><td style="padding:4px;">Toplam item</td><td style="padding:4px;text-align:right;">{{ toplam }}</td></tr>
+          <tr><td style="padding:4px;color:#2e7d32;">Basarili</td><td style="padding:4px;text-align:right;color:#2e7d32;">{{ b_sayi }}</td></tr>
+          <tr><td style="padding:4px;color:#c62828;">Hatali</td><td style="padding:4px;text-align:right;color:#c62828;">{{ h_sayi }}</td></tr>
+          </table>
+          <div style="background:#eee;border-radius:4px;overflow:hidden;height:22px;width:100%;">
+          <div style="background:#2e7d32;height:22px;width:{{ b_pct }}%;float:left;"></div>
+          <div style="background:#c62828;height:22px;width:{{ h_pct }}%;float:left;"></div>
+          </div>
+          <p style="font-size:12px;color:#666;">Yesil: basarili (%{{ b_pct }}) / Kirmizi: hatali (%{{ h_pct }})</p>
+          <h3 style="margin-bottom:4px;">Ortam bazinda</h3>
+          <table style="border-collapse:collapse;width:100%;">
+          <tr style="background:#f5f5f5;"><th style="text-align:left;padding:4px;">Ortam</th><th style="text-align:right;padding:4px;">Basarili</th><th style="text-align:right;padding:4px;">Hatali</th></tr>
+          {%- for env in deploy_environments %}
+          {%- set env_b = basarili_items | default([]) | selectattr('environment', 'equalto', env) | list | length %}
+          {%- set env_h = hatali_items | default([]) | selectattr('environment', 'equalto', env) | list | length %}
+          <tr><td style="padding:4px;">{{ env }}</td><td style="padding:4px;text-align:right;">{{ env_b }}</td><td style="padding:4px;text-align:right;color:{{ '#c62828' if env_h > 0 else '#333' }};">{{ env_h }}</td></tr>
+          {%- endfor %}
+          </table>
+          </div>
+      when: enable_processing | bool
+
+    - name: "10f - Sonuc raporu maili"
+      ansible.windows.win_powershell:
+        script: |
+          $html = @'
+          {{ rapor_html }}
+          '@
+          Send-MailMessage -SmtpServer '{{ mail_smtp_host }}' -Port {{ mail_smtp_port }} `
+              -From '{{ mail_from }}' -To '{{ mail_to }}' `
+              -Subject 'Front Deploy Sonuc - {{ hatali_items | default([]) | length }} hatali / {{ download_items | default([]) | length }} toplam ({{ calisma_modu }})' `
+              -Body $html -BodyAsHtml
+      changed_when: false
+      failed_when: false
       when: enable_processing | bool
 
     # ========================================================
