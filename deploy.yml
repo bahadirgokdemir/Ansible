@@ -143,19 +143,18 @@
           status_code: "{{ talep_pages.results[0].status_code | default('yok') }}"
           content_type: "{{ talep_pages.results[0].content_type | default('yok') }}"
           content_veri_tipi: "{{ talep_pages.results[0].content | type_debug }}"
-          kayit_sayisi: "{{ (talep_pages.results[0].content | default([])) | length }}"
+          ham_metin: "{{ talep_pages.results[0].content | default('') | truncate(1500) }}"
+          kayit_sayisi: "{{ (talep_pages.results[0].content | default('[]', true) | from_json) | length }}"
           ilk_kayit_anahtarlari: >-
-            {{ (talep_pages.results[0].content[0].keys() | list)
-               if ((talep_pages.results[0].content | default([])) | length > 0)
-               else 'kayit_yok' }}
-          ham_json: "{{ talep_pages.results[0].content | to_nice_json }}"
+            {%- set parsed = talep_pages.results[0].content | default('[]', true) | from_json -%}
+            {{ (parsed[0].keys() | list) if (parsed | length > 0) else 'kayit_yok' }}
 
     - name: "03b - Talep listesini birlestir"
       ansible.builtin.set_fact:
         talepler: >-
           {%- set out = [] -%}
           {%- for r in talep_pages.results -%}
-            {%- for t in (r.content | default([], true)) -%}
+            {%- for t in (r.content | default('[]', true) | from_json) -%}
               {%- if t.id is defined and t.id -%}
                 {%- set _ = out.append({
                       'environment': r.item.0,
@@ -217,7 +216,7 @@
           {%- set out = [] -%}
           {%- set seen = [] -%}
           {%- for r in detay_result.results -%}
-            {%- for d in (r.content | default([], true)) -%}
+            {%- for d in (r.content | default('[]', true) | from_json) -%}
               {%- set key = (r.item.id | string) ~ '|' ~ (d.itemName | default('')) ~ '|' ~ (d.artipath | default(d.artiPath | default(''))) -%}
               {%- if key not in seen and (d.artipath | default(d.artiPath | default(''))) -%}
                 {%- set _ = seen.append(key) -%}
