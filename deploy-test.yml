@@ -1,5 +1,8 @@
 # ============================================================================
-# Front Deploy - Request Watcher  (HIBRIT TOPOLOJI)
+# Front Deploy - Request Watcher  (HIBRIT TOPOLOJI)  -- TEST KOPYASI --
+# Prod dosyasi: deploy.yml. Bu dosya SADECE test backend'ine (kysbackendtest)
+# karsi calisir. Akis/mantik prod ile birebir aynidir; sadece web_service_url,
+# rapor_ortam_adi ve mail konu basliklari farklidir.
 # ============================================================================
 # NEDEN HIBRIT:
 #   - KYS/token API ve artifact repo erisimi YALNIZCA INFPRDDIAG'dan acik
@@ -23,17 +26,16 @@
 #   smb_user, smb_password
 # ============================================================================
 
-- name: Front Deploy - Request Watcher
+- name: Front Deploy - Request Watcher (TEST)
   hosts: windows_targets          # INFPRDDIAG
   gather_facts: false
 
   vars:
     # --- Rapor mailinde gosterilecek ortam etiketi ---
-    # Test kopyasinda (deploy-test.yml) "TEST" olarak override edilir.
-    rapor_ortam_adi: "PROD"
+    rapor_ortam_adi: "TEST"
 
-    # --- API ---
-    web_service_url: "https://kysbackend.ibtech.com.tr/api"
+    # --- API (test backend) ---
+    web_service_url: "https://kysbackendtest.ibtech.com.tr/api"
     token_api_url: "https://infraapps.qnb.com.tr/api/GetTokenKysApi/GetData"
     deploy_environments: [test, preprod, prod]
     talep_page_size: 100
@@ -141,6 +143,18 @@
       register: talep_pages
       changed_when: false
 
+    - name: "03a - DEBUG: Ham API yaniti (ilk sayfa)"
+      ansible.builtin.debug:
+        msg:
+          status_code: "{{ talep_pages.results[0].status_code | default('yok') }}"
+          content_type: "{{ talep_pages.results[0].content_type | default('yok') }}"
+          content_veri_tipi: "{{ talep_pages.results[0].content | type_debug }}"
+          ham_metin: "{{ talep_pages.results[0].content | default('') | truncate(1500) }}"
+          kayit_sayisi: "{{ (talep_pages.results[0].content | default('[]', true) | from_json) | length }}"
+          ilk_kayit_anahtarlari: >-
+            {%- set parsed = talep_pages.results[0].content | default('[]', true) | from_json -%}
+            {{ (parsed[0].keys() | list) if (parsed | length > 0) else 'kayit_yok' }}
+
     - name: "03b - Talep listesini birlestir"
       ansible.builtin.set_fact:
         talepler: >-
@@ -181,7 +195,7 @@
           '@
           Send-MailMessage -SmtpServer '{{ mail_smtp_host }}' -Port {{ mail_smtp_port }} `
               -From '{{ mail_from }}' -To '{{ mail_to }}' `
-              -Subject 'Front Deploy - {{ talepler | length }} YT talep tespit edildi' -Body $b
+              -Subject '[TEST] Front Deploy - {{ talepler | length }} YT talep tespit edildi' -Body $b
       changed_when: false
       failed_when: false
 
