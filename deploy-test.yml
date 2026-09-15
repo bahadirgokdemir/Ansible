@@ -22,8 +22,8 @@
 #   Custom EE'ye eklenmesi gerekir:  RUN dnf install -y samba-client
 #
 # EXTRA VARS (AAP - sifreli/Survey):
-#   proxy_user, proxy_password, proxy_url (ops.), deploy_api_token (fallback),
-#   smb_user, smb_password
+#   test_basic_auth_user, test_basic_auth_password (TEST backend /login icin),
+#   deploy_api_token (fallback), smb_user, smb_password
 # ============================================================================
 
 - name: Front Deploy - Request Watcher (TEST)
@@ -85,25 +85,19 @@
     # 02 - Token (proxy NTLM gerektigi icin tek PS blogu kaldi;
     #      uri/win_uri NTLM proxy auth yapamiyor)
     # ========================================================
-    - name: "02 - Token al (GetTokenKysApi, proxy NTLM)"
+    # TEST backend'in kendi login endpoint'i var (Basic Auth), prod'un
+    # GetTokenKysApi/NTLM proxy tokeni burada GECERSIZ (401 doner).
+    # AAP extra var (sifreli/Survey): test_basic_auth_user, test_basic_auth_password
+    - name: "02 - Token al (TEST backend - Basic Auth /login)"
       ansible.windows.win_powershell:
         script: |
           $ErrorActionPreference = 'Stop'
-          $cred = New-Object System.Management.Automation.PSCredential(
-              '{{ proxy_user }}',
-              (ConvertTo-SecureString '{{ proxy_password }}' -AsPlainText -Force))
-          $args = @{ Uri = '{{ token_api_url }}'; Method = 'Get'
-                     TimeoutSec = {{ http_timeout_seconds }}; UseBasicParsing = $true
-                     Credential = $cred }
-          $p = '{{ proxy_url | default("") }}'
-          if (-not $p) {
-              $ie = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -EA SilentlyContinue).ProxyServer
-              if ($ie) { $p = "http://$ie" }
-          }
-          if ($p) { $args['Proxy'] = $p; $args['ProxyCredential'] = $cred }
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('{{ test_basic_auth_user }}:{{ test_basic_auth_password }}'))
+          $headers = @{ Authorization = "Basic $b64" }
           try {
-              $t = (Invoke-WebRequest @args).Content.Trim()
-              if (-not $t.StartsWith('eyJ')) { throw "gecersiz token" }
+              $resp = Invoke-RestMethod -Uri '{{ web_service_url }}/login' -Method Post -Headers $headers -TimeoutSec {{ http_timeout_seconds }}
+              $t = if ($resp -is [string]) { $resp.Trim() } else { $resp.token }
+              if (-not $t) { throw "bos token donuldu" }
               @{ ok = $true; token = $t } | ConvertTo-Json -Compress
           } catch {
               @{ ok = $false; token = ''; error = $_.Exception.Message } | ConvertTo-Json -Compress
